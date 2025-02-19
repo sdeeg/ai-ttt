@@ -2,9 +2,9 @@
 
 ## Metadata
 ```yaml
-last_updated: 2024-02-18
-version: 1.0
-status: implementation_phase
+last_updated: 2024-02-19
+version: 1.1
+status: implemented
 primary_language: Kotlin
 framework: Spring Boot
 architecture_type: Two-tier
@@ -30,69 +30,117 @@ graph TD
 
 ### Core Data Structures
 ```kotlin
-// Key domain interfaces and data classes
+enum class Player { X, O }
+
 data class Position(val row: Int, val col: Int)
-data class Move(val position: Position, val player: Player)
-data class Board(val cells: List<List<Cell>>)
+
+data class Move(
+    val player: Player,
+    val position: Position,
+    val timestamp: Instant
+)
+
 data class GameState(
     val id: String,
     val board: Board,
-    val currentPlayer: Player,
-    val status: GameStatus
+    val status: GameStatus,
+    val winner: Player?,
+    val lastMove: Move?
 )
+
+enum class GameStatus {
+    NEW,
+    IN_PROGRESS,
+    COMPLETED,
+    ABANDONED
+}
 ```
 
 ## Component Architecture
 ### 1. Domain Layer [IMPLEMENTED]
 Location: `src/main/kotlin/us/planet10/ai/ttt/domain/`
 ```kotlin
-// Key interfaces
 interface Cell {
     val position: Position
     val player: Player?
 }
 
 interface Board {
+    val cells: List<List<Cell>>
+    val currentPlayer: Player
+    val moveCount: Int
+    
     fun makeMove(move: Move): Board
     fun isValidMove(move: Move): Boolean
     fun getWinner(): Player?
 }
+
+// Concrete implementation: GameBoard
+data class GameBoard(
+    override val cells: List<List<Cell>>,
+    override val currentPlayer: Player,
+    override val moveCount: Int
+) : Board
 ```
 
 Dependencies:
 - None (core domain layer)
 
-### 2. Game Engine [IN PROGRESS]
+### 2. Game Engine [IMPLEMENTED]
 Location: `src/main/kotlin/us/planet10/ai/ttt/engine/`
 ```kotlin
-// Core interface
-interface GameEngine {
-    fun makeMove(gameState: GameState, move: Move): GameState
-    fun validateMove(gameState: GameState, move: Move): Boolean
-    fun checkWinCondition(board: Board): Player?
-    fun generateAiMove(gameState: GameState): Move
+@Component
+class GameEngine {
+    fun createGame(id: String): GameState
+    fun makeMove(gameState: GameState, position: Position): GameState
+    fun generateAiMove(gameState: GameState): Position
+    
+    // Private implementation details
+    private fun minimax(board: Board, depth: Int, isMaximizing: Boolean, 
+                       originalPlayer: Player, alpha: Int, beta: Int): Int
+    private fun evaluatePosition(board: Board, player: Player): Int
+    private fun validateGameState(gameState: GameState)
+    private fun determineGameStatus(board: Board, winner: Player?): GameStatus
 }
 ```
+
+Key Features:
+- Minimax algorithm with alpha-beta pruning
+- Position evaluation based on board control
+- Configurable search depth (default: 6)
+- Comprehensive move validation
+- Game state management
 
 Dependencies:
 - Domain Layer (`Board.kt`, `GameState.kt`)
 
-### 3. Service Layer [PENDING]
+### 3. Service Layer [IMPLEMENTED]
 Location: `src/main/kotlin/us/planet10/ai/ttt/service/`
 ```kotlin
-// Service interface
-interface GameService {
+@Service
+class GameService(private val gameEngine: GameEngine) {
+    private val games = ConcurrentHashMap<String, GameState>()
+    
     fun createGame(): GameState
-    fun processMove(gameId: String, move: Move): GameState
-    fun requestAiMove(gameId: String): Move
+    fun getGame(gameId: String): GameState
+    fun makeMove(gameId: String, position: Position): GameState
+    fun makeAiMove(gameId: String): GameState
+    fun abandonGame(gameId: String): GameState
+    fun cleanupOldGames()
 }
 ```
+
+Key Features:
+- Thread-safe game state management using ConcurrentHashMap
+- Unique game ID generation
+- Game lifecycle management
+- Automatic cleanup of completed/abandoned games
 
 Dependencies:
 - Game Engine (`GameEngine.kt`)
 - Domain Layer (via Game Engine)
 
-### 4. API Layer [PENDING]
+### 4. API Layer [IMPLEMENTED]
 Location: `src/main/kotlin/us/planet10/ai/ttt/api/`
 
 REST Endpoints:
@@ -107,18 +155,29 @@ GET /api/game/{id}:
 
 POST /api/game/{id}/move:
   description: Make move
-  request: Move
+  request: MoveRequest
   response: GameState
 
-GET /api/game/{id}/ai-move:
+POST /api/game/{id}/ai-move:
   description: Request AI move
-  response: Move
+  response: GameState
+
+POST /api/game/{id}/abandon:
+  description: Abandon game
+  response: GameState
 ```
+
+Key Features:
+- Comprehensive error handling
+- Swagger/OpenAPI documentation
+- CORS configuration
+- Response DTOs with proper schema documentation
+- Global exception handler
 
 Dependencies:
 - Service Layer (`GameService.kt`)
 
-### 5. Frontend [NOT STARTED]
+### 5. Frontend [IMPLEMENTED]
 Location: `src/main/resources/static/`
 
 Component Structure:
@@ -128,6 +187,15 @@ frontend/
 ├── styles.css     # Visual styling
 └── game.js        # Game logic and API integration
 ```
+
+Key Features:
+- Object-oriented game management (TicTacToe class)
+- Automatic game initialization
+- Real-time board updates
+- Move highlighting
+- Game state management
+- Error handling and user feedback
+- Automatic game abandonment on page unload
 
 ## Implementation Guidelines
 ### 1. Code Organization
@@ -148,19 +216,30 @@ us.planet10.ai.ttt/
 
 ### 2. Error Handling
 ```kotlin
-// Error hierarchy
-sealed class GameError : RuntimeException {
-    data class InvalidMove(val reason: String) : GameError()
-    data class GameNotFound(val gameId: String) : GameError()
-    data class IllegalGameState(val state: GameState) : GameError()
+// Controller-level error handling
+@ExceptionHandler(Exception::class)
+fun handleException(e: Exception): ResponseEntity<ErrorResponse> {
+    val status = when (e) {
+        is IllegalArgumentException -> HttpStatus.BAD_REQUEST
+        is IllegalStateException -> HttpStatus.CONFLICT
+        else -> HttpStatus.INTERNAL_SERVER_ERROR
+    }
+    return ResponseEntity.status(status).body(ErrorResponse(...))
 }
 
-// Error response format
-data class ErrorResponse(
-    val code: String,
-    val message: String,
-    val details: Map<String, Any>? = null
-)
+// Service-level validation
+fun getGame(gameId: String): GameState {
+    return games[gameId] ?: throw IllegalArgumentException("Game not found: $gameId")
+}
+
+// Engine-level validation
+private fun validateGameState(gameState: GameState) {
+    when (gameState.status) {
+        GameStatus.COMPLETED -> throw IllegalStateException("Game is already completed")
+        GameStatus.ABANDONED -> throw IllegalStateException("Game has been abandoned")
+        else -> {} // NEW and IN_PROGRESS are valid
+    }
+}
 ```
 
 ### 3. Testing Strategy
@@ -183,28 +262,43 @@ class GameEngineTest {
 - All game state transitions are immutable
 - State history is preserved for AI analysis
 - Each state change is validated before application
+- Thread-safe game state storage
 
 ### 2. Decision Points
 - Move validation: `GameEngine.validateMove()`
 - Win condition: `GameEngine.checkWinCondition()`
 - AI move generation: `GameEngine.generateAiMove()`
+- Game status determination: `GameEngine.determineGameStatus()`
 
 ### 3. Key Algorithms
 ```kotlin
-// Minimax algorithm structure
-fun minimax(board: Board, depth: Int, isMax: Boolean): Int {
-    if (isTerminal(board) || depth == 0) {
-        return evaluate(board)
+// Minimax with alpha-beta pruning
+private fun minimax(
+    board: Board, 
+    depth: Int, 
+    isMaximizing: Boolean, 
+    originalPlayer: Player,
+    alpha: Int,
+    beta: Int
+): Int {
+    // Terminal state checks
+    val winner = board.getWinner()
+    when {
+        winner == originalPlayer -> return 10 - depth
+        winner != null -> return -10 + depth
+        board.moveCount == BOARD_SIZE * BOARD_SIZE -> return 0
+        depth == MAX_DEPTH -> return evaluatePosition(board, originalPlayer)
     }
-    
-    return if (isMax) {
-        generateMoves(board).maxOf { move ->
-            minimax(makeMove(board, move), depth - 1, false)
-        }
+
+    // Recursive minimax with pruning
+    if (isMaximizing) {
+        var value = Int.MIN_VALUE
+        var currentAlpha = alpha
+        // ... pruning logic
     } else {
-        generateMoves(board).minOf { move ->
-            minimax(makeMove(board, move), depth - 1, true)
-        }
+        var value = Int.MAX_VALUE
+        var currentBeta = beta
+        // ... pruning logic
     }
 }
 ```
@@ -212,16 +306,22 @@ fun minimax(board: Board, depth: Int, isMax: Boolean): Int {
 ## Performance Considerations
 ### 1. Response Time Targets
 - API Response: < 100ms
-- AI Move Generation: < 1s
+- AI Move Generation: < 1s (depth-limited)
 - State Updates: < 50ms
 
 ### 2. Resource Usage
 - Memory per Game: < 1MB
-- AI Search Depth: Configurable (3-7)
-- Connection Pool Size: 10
+- AI Search Depth: 6 levels
+- Concurrent Games: Thread-safe with ConcurrentHashMap
+- Connection Pool: Spring Boot default
 
 ## Implementation Status
-See `implementation_state.md` for detailed current development status.
+All components are fully implemented and functional:
+- Domain Layer: Complete with all core entities
+- Game Engine: Implemented with minimax AI
+- Service Layer: Complete with thread-safe state management
+- API Layer: All endpoints implemented with documentation
+- Frontend: Complete with full game lifecycle support
 
 ## Task Tracking
 See `project_tracking.md` for development progress and next steps.
